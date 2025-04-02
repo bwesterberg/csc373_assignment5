@@ -24,20 +24,19 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 import joblib
-from sklearn.feature_extraction.text import HashingVectorizer
+from pyspark.ml.recommendation import ALS
+from pyspark.sql import SparkSession
 
 
+seed=1
 
+def estimation(train_X, dev_X, train_y, dev_y, output_handle):
 
-def estimation(df):
-    X, y = utils.create_target(df)
-    train_X, dev_X, train_y, dev_y = train_test_split(X, y)
-    
     num_cols, text_cols, cat_cols = utils.sort_cols(train_X)
             
+    vectorizer = TfidfVectorizer(stop_words='english', min_df=0.1)
     text_preprocessor = Pipeline(steps=[
-        ('vectorizer', TfidfVectorizer()),
-        #('decomp', TruncatedSVD())
+        ('vectorizer', vectorizer),
     ])
 
     col_transformer = ColumnTransformer(transformers=([
@@ -46,8 +45,8 @@ def estimation(df):
         ('num', StandardScaler(), num_cols)
     ]))
 
-    
-    estimator = SGDRegressor()
+    name = "SGD"
+    estimator = SGDRegressor(random_state=seed)
 
     pipeline = Pipeline(steps=[
         ('col_transformer', col_transformer),
@@ -57,26 +56,22 @@ def estimation(df):
     pipeline.fit(train_X, train_y)
     
     preds = pipeline.predict(dev_X)
-    
-    over_pred_score, under_pred_score = utils.over_under_pred_scores(dev_y, preds)
-    print(f"R-Squared: {pipeline.score(train_X, train_y):.3f}")
-    print(f"MSE (dev): {mean_squared_error(dev_y, preds):.3f}")
-    print(f"Overprediction Rate (dev): {over_pred_score:.2f}")
-    print(f"Underprediction Rate (dev): {under_pred_score:.2f}")
+
+    scores = {}
+    scores['r2'] = pipeline.score(train_X, train_y)
+    scores['mse'] = mean_squared_error(dev_y, preds)
+    scores['over'], scores['under'] = utils.over_under_pred_scores(dev_y, preds)
+
+    output_handle.write(f"{name}:\n")
+    utils.write_estimation_scores(output_handle, scores)
 
 
-def classification(df):
-    X, y = utils.create_target(df)
-    # Binarizes y for above and below median, 1 if above, 0 if below
-    y = (y > y.median()).astype(int)
-    train_X, dev_X, train_y, dev_y = train_test_split(X, y)
-    
+def classification(train_X, dev_X, train_y, dev_y, output_handle, model=None):
     num_cols, text_cols, cat_cols = utils.sort_cols(train_X)
 
-    # Hashing Vectorizer works faster than TFIDF        
+    vectorizer = TfidfVectorizer(stop_words='english', min_df=0.1)
     text_preprocessor = Pipeline(steps=[
-        ('vectorizer', HashingVectorizer()),
-        #('decomp', TruncatedSVD())
+        ('vectorizer', vectorizer),
     ])
 
     col_transformer = ColumnTransformer(transformers=([
@@ -85,15 +80,27 @@ def classification(df):
         ('num', StandardScaler(), num_cols)
     ]))
 
-    # Dummy classifier, along with two methods for classification, Logistic Reg., and Random Forest
     classifiers = {
         "Dummy": DummyClassifier(),
-        "Logistic Regression": LogisticRegression(solver = 'saga'),
-        "Random Forest": RandomForestClassifier(n_estimators=1000)
+        "Logistic Regression": LogisticRegression(solver = 'saga', random_state=seed),
+        "Random Forest": RandomForestClassifier(n_estimators=100, random_state=seed)
     }
+    
+
+    if model is not None:
+        model.fit(train_X, train_y)
+        scores = {}
+        scores['accuracy'] = accuracy_score(dev_y, preds)
+        scores['over'], scores['under'] = utils.over_under_pred_scores(dev_y, preds, classification=True)
+    
+        utils.write_classification_scores(output_handle, scores)
+        
+        return
+
 
     best_acc = 0
     best_model = None
+
     for name, classifier in classifiers.items():
         
         pipeline = Pipeline(steps=[
@@ -103,39 +110,91 @@ def classification(df):
 
         pipeline.fit(train_X, train_y)
         preds = pipeline.predict(dev_X)
-        accuracy = accuracy_score(dev_y, preds)
 
-        over_pred_score = sum((preds == 1) & (dev_y == 0)) / len(dev_y)
-        under_pred_score = sum((preds == 0) & (dev_y == 1)) / len(dev_y)        
+        scores = {}
+        scores['accuracy'] = accuracy_score(dev_y, preds)
+        scores['over'], scores['under'] = utils.over_under_pred_scores(dev_y, preds, classification=True)
+    
+        output_handle.write(f"{name}:\n")
+        utils.write_classification_scores(output_handle, scores)
 
-        print(f"\nClassifier: {name}")
-        print(f"Accuracy: {accuracy:.3f}")
-        print(f"Overprediction Rate (dev): {over_pred_score:.2f}")
-        print(f"Underprediction Rate (dev): {under_pred_score:.2f}\n")    
-        if accuracy > best_acc:
-            best_acc = accuracy
+        if scores['accuracy'] > best_acc:
+            best_acc = scores['accuracy']
             best_model = pipeline
 
     joblib.dump(best_model, "best_model.pkl")
+    return best_model
     
+
+def recommendation(train_X, dev_X, train_y, dev_y, output_handle):
+    spark = SparkSession.builder.appName("SteamGameRecommendation").getOrCreate()
+
+    train_spark_X = spark.createDataFrame(train_X)
+    train_spark_y = spark.createDataFrame(train_y)
+
+    dev_spark_X = spark.createDataFrame(dev_X)
+    dev_spark_y = spark.createDataFrame(dev_y)
+
+    als = ALS(userCol= "username",
+              itemCol= "product_id",
+              ratingCol= "hours")
+    
+    model = als.fit(train_spark_X, train_spark_y)
+    preds = model.transform(dev_spark_X, dev_spark_y)
+
+    scores = {}
+    scores['mse'] = mean_squared_error(dev_spark_y, preds)
+    scores['over'], scores['under'] = utils.over_under_pred_scores(dev_spark_y, preds)
+
+    output_handle.write(f"Recommendation:\n")
+    utils.write_recommendation_scores(output_handle, scores)
+    model.save("../output/best_recommendation_model")
+    
+    return model
+
 
 def main():
-    dataset = utils.get_dataset()
-    df = utils.create_df(dataset)
+    #dataset = utils.get_dataset()
+    #df = utils.create_df(dataset)
     
-    #df = utils.get_subsample()
-    utils.report_df(df)
+    df = utils.get_subsample()
+
+    #utils.report_df(df)
     
     cleaned_df = utils.clean_data(df)
+    X, y = utils.create_target(cleaned_df)
     
-    estimation(cleaned_df)
-    classification(cleaned_df)
-    #utils.subsample_df(df)
+    #Original Estimation
+    train_X, dev_X, train_y, dev_y = train_test_split(X, y, random_state=seed)
+    handle = open("../output/model_scores/estimation/original.txt", "w+")
+    estimation(train_X, dev_X, train_y, dev_y, handle)
+    handle.close()
 
-    '''sample_df = utils.subsample_df(df)
-    cleaned_sample = utils.clean_data(sample_df)
-    estimation(cleaned_sample)
-    classification(cleaned_sample)'''
+    #Removed outliers
+    ro_train_X, ro_train_y = utils.remove_outliers(train_X, train_y)
+    handle = open("../output/model_scores/estimation/removed_outliers.txt", "w+")
+    estimation(ro_train_X, dev_X, ro_train_y, dev_y, handle)
+    handle.close()
+
+    #Log2 Scaled
+    train_log_y = utils.get_log_y(train_y) 
+    dev_log_y = utils.get_log_y(dev_y) 
+    handle = open("../output/model_scores/estimation/log2.txt", "w+")
+    estimation(train_X, dev_X, train_log_y, dev_log_y, handle)
+    handle.close()
+
+    #Original Classification
+    binary_y = utils.binarize_y(y)    
+    train_X, dev_X, train_y, dev_y = train_test_split(X, binary_y, random_state=seed)
+    handle = open("../output/model_scores/classification/original.txt", "w+")
+    best_clsf_model = classification(train_X, dev_X, train_y, dev_y, handle)
+    handle.close()
+
+    #Recommendation system for creating recommendations using log transformed hours
+    handle = open("../output/model_scores/recommendation/recommendation.txt", "w+")
+    rec_model = recommendation(train_X, dev_X, train_log_y, dev_log_y, handle)
+    handle.close()
+    #utils.subsample_df(df)
 
 
 
