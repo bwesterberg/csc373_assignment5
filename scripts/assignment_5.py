@@ -24,6 +24,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 import joblib
+from sklearn.feature_extraction.text import HashingVectorizer
+
 
 
 
@@ -70,9 +72,10 @@ def classification(df):
     train_X, dev_X, train_y, dev_y = train_test_split(X, y)
     
     num_cols, text_cols, cat_cols = utils.sort_cols(train_X)
-            
+
+    # Hashing Vectorizer works faster than TFIDF        
     text_preprocessor = Pipeline(steps=[
-        ('vectorizer', TfidfVectorizer()),
+        ('vectorizer', HashingVectorizer()),
         #('decomp', TruncatedSVD())
     ])
 
@@ -82,10 +85,11 @@ def classification(df):
         ('num', StandardScaler(), num_cols)
     ]))
 
+    # Dummy classifier, along with two methods for classification, Logistic Reg., and Random Forest
     classifiers = {
         "Dummy": DummyClassifier(),
         "Logistic Regression": LogisticRegression(solver = 'saga'),
-        "Random Forest": RandomForestClassifier(n_estimators=100)
+        "Random Forest": RandomForestClassifier(n_estimators=1000)
     }
 
     best_acc = 0
